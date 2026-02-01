@@ -1,0 +1,122 @@
+---
+- name: Install and configure PostgreSQL 17 on Rocky/RHEL (LAB)
+  hosts: dbservers
+  become: true
+  vars:
+    pg_version: "17"
+    pg_service: "postgresql-17"
+    pg_data: "/var/lib/pgsql/17/data"
+    postgres_password: "postgres"
+    allow_cidr: "0.0.0.0/0"   # LAB ONLY (tighten for real environments)
+
+  tasks:
+    - name: Install base packages
+      ansible.builtin.dnf:
+        name:
+          - dnf-plugins-core
+          - ca-certificates
+          - curl
+          - vim
+          - firewalld
+        state: present
+
+    - name: Disable default PostgreSQL module (prevents conflicts)
+      ansible.builtin.command: dnf -y module disable postgresql
+      register: disable_module
+      changed_when: "'Nothing to do' not in disable_module.stdout"
+      failed_when: false
+
+    - name: Install PGDG repository RPM (EL8/EL9)
+      ansible.builtin.dnf:
+        name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Install PostgreSQL 17 packages
+      ansible.builtin.dnf:
+        name:
+          - "postgresql{{ pg_version }}"
+          - "postgresql{{ pg_version }}-server"
+          - "postgresql{{ pg_version }}-contrib"
+        state: present
+
+    - name: Initialize database if PG_VERSION not present
+      ansible.builtin.stat:
+        path: "{{ pg_data }}/PG_VERSION"
+      register: pg_version_file
+
+    - name: Run initdb (postgresql-17-setup initdb)
+      ansible.builtin.command: "/usr/pgsql-{{ pg_version }}/bin/postgresql-{{ pg_version }}-setup initdb"
+      when: not pg_version_file.stat.exists
+
+    - name: Set listen_addresses = '*'
+      ansible.builtin.lineinfile:
+        path: "{{ pg_data }}/postgresql.conf"
+        regexp: '^#?listen_addresses\\s*='
+        line: "listen_addresses = '*'"
+        backup: true
+
+    - name: Ensure password_encryption is scram-sha-256
+      ansible.builtin.lineinfile:
+        path: "{{ pg_data }}/postgresql.conf"
+        regexp: '^#?password_encryption\\s*='
+        line: "password_encryption = 'scram-sha-256'"
+        backup: true
+
+    - name: Configure pg_hba.conf for LAB password access (scram)
+      ansible.builtin.copy:
+        dest: "{{ pg_data }}/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+        backup: true
+        content: |
+          # TYPE  DATABASE        USER            ADDRESS                 METHOD
+          local   all             all                                     scram-sha-256
+          host    all             all             127.0.0.1/32            scram-sha-256
+          host    all             all             ::1/128                 scram-sha-256
+          # LAB ONLY - allow remote:
+          host    all             all             {{ allow_cidr }}        scram-sha-256
+          host    all             all             ::0/0                   scram-sha-256
+
+    - name: Enable and start PostgreSQL service
+      ansible.builtin.service:
+        name: "{{ pg_service }}"
+        state: started
+        enabled: true
+
+    - name: Set postgres password
+      ansible.builtin.command: >
+        sudo -u postgres /usr/pgsql-{{ pg_version }}/bin/psql
+        -v ON_ERROR_STOP=1
+        -c "ALTER USER postgres WITH PASSWORD '{{ postgres_password }}';"
+      changed_when: true
+
+    - name: Reload PostgreSQL to apply config changes
+      ansible.builtin.service:
+        name: "{{ pg_service }}"
+        state: reloaded
+
+    - name: Ensure firewalld is running (if installed)
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+      failed_when: false
+
+    - name: Open PostgreSQL port 5432 in firewalld (LAB)
+      ansible.posix.firewalld:
+        port: "5432/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      failed_when: false
+
+    - name: Show PostgreSQL version (verification)
+      ansible.builtin.command: "sudo -u postgres /usr/pgsql-{{ pg_version }}/bin/psql -tAc 'SELECT version();'"
+      register: pg_ver
+      changed_when: false
+
+    - name: Print PostgreSQL version
+      ansible.builtin.debug:
+        msg: "{{ pg_ver.stdout }}"
